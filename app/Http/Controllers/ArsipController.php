@@ -42,39 +42,61 @@ class ArsipController extends Controller
             return redirect()->route('dashboard')->with('error', 'Admin tidak memiliki akses ke Manajemen Arsip.');
         }
 
-        $search = strtolower($request->search);
+        $search = $request->filled('search') ? strtolower($request->search) : null;
         $kategori_id = $request->kategori_id;
         $kategori_dokumen = $request->kategori_dokumen;
 
         $query = Arsip::with('kategori_bagian');
-        $kategoriSidebar = collect();
         $listKategoriDokumen = $this->getListKategoriDokumen();
 
-        // ================= FILTER HAK AKSES =================
-        $hakAksesLihat = HakAkses::where('grup_pengakses', $grupUser)
+        // ================= LOGIKA HAK AKSES PINTAR =================
+        // Ambil daftar grup yang diberi izin akses dari tabel HakAkses
+        $hakAksesLihat = HakAkses::whereRaw('LOWER(grup_pengakses) = ?', [strtolower($grupUser)])
             ->where('bisa_lihat', 1)
             ->pluck('grup_pemilik')
             ->toArray();
+        
+        // Masukkan grup sendiri ke dalam daftar akses
         $hakAksesLihat[] = $grupUser;
 
-        $hakAksesKomentar = HakAkses::where('grup_pengakses', $grupUser)
+        $hakAksesKomentar = HakAkses::whereRaw('LOWER(grup_pengakses) = ?', [strtolower($grupUser)])
             ->where('bisa_komentar', 1)
             ->pluck('grup_pemilik')
             ->toArray();
 
+        // Filter kategori yang muncul di Sidebar
+        $semuaKategori = KategoriBagian::all();
+        
         if (in_array($role, ['pimpinan', 'ketua', 'wakil'])) {
-            $kategoriSidebar = KategoriBagian::all();
+            $kategoriSidebar = $semuaKategori;
         } else {
-            $kategoriSidebar = KategoriBagian::whereIn('nama_bagian', $hakAksesLihat)->get();
-            $query->whereIn('kategori_bagian_id', $kategoriSidebar->pluck('id'));
+            $kategoriSidebar = $semuaKategori->filter(function ($kategori) use ($hakAksesLihat) {
+                $namaDB = strtolower(trim($kategori->nama_bagian));
+                foreach ($hakAksesLihat as $hak) {
+                    $hakAkses = strtolower(trim($hak));
+                    if (str_contains($namaDB, $hakAkses) || str_contains($hakAkses, $namaDB)) {
+                        return true;
+                    }
+                }
+                return false;
+            });
+
+            // Terapkan filter ke query utama
+            if ($kategoriSidebar->isNotEmpty()) {
+                $query->whereIn('kategori_bagian_id', $kategoriSidebar->pluck('id'));
+            } else {
+                $query->whereRaw('1 = 0'); // Paksa kosong jika tidak ada akses
+            }
         }
 
+        // Filter berdasarkan Bagian
         if ($kategori_id) {
             $query->where('kategori_bagian_id', $kategori_id);
         }
 
+        // Filter berdasarkan Jenis Dokumen
         if ($kategori_dokumen) {
-            $query->where('kategori_dokumen', $kategori_dokumen);
+            $query->where('kategori_dokumen', 'LIKE', '%' . trim($kategori_dokumen) . '%');
         }
 
         // ================= PENCARIAN TF-IDF =================
@@ -83,9 +105,9 @@ class ArsipController extends Controller
             $query->where(function ($q) use ($searchTerms) {
                 foreach ($searchTerms as $term) {
                     $q->orWhere('nomor_dokumen', 'like', "%{$term}%")
-                        ->orWhere('judul_arsip', 'like', "%{$term}%")
-                        ->orWhere('kategori_dokumen', 'like', "%{$term}%")
-                        ->orWhere('deskripsi_metadata', 'like', "%{$term}%");
+                      ->orWhere('judul_arsip', 'like', "%{$term}%")
+                      ->orWhere('kategori_dokumen', 'like', "%{$term}%")
+                      ->orWhere('deskripsi_metadata', 'like', "%{$term}%");
                 }
             });
 
@@ -130,6 +152,7 @@ class ArsipController extends Controller
                 $arsipsSorted = $arsipsRaw->sortByDesc('relevance_score')->values();
                 $perPage = 10;
                 $page = Paginator::resolveCurrentPage() ?: 1;
+                
                 $arsips = new LengthAwarePaginator(
                     $arsipsSorted->forPage($page, $perPage),
                     $arsipsSorted->count(),
@@ -161,23 +184,30 @@ class ArsipController extends Controller
             return redirect()->route('dashboard')->with('error', 'Admin tidak memiliki akses ke Manajemen Arsip.');
         }
 
+        $semuaKategori = KategoriBagian::all();
+        
         if (in_array($role, ['pimpinan', 'ketua', 'wakil'])) {
-            $kategori = KategoriBagian::all();
+            $kategori = $semuaKategori;
         } else {
-            // Kita coba cari yang namanya sama persis dulu
-            $kategori = KategoriBagian::where('nama_bagian', $grupUser)->get();
-            // Kalau nggak ketemu (karena typo di database), baru munculkan semua biar user bisa pilih manual
+            // Filter otomatis upload berdasarkan kemiripan grup
+            $kategori = $semuaKategori->filter(function ($k) use ($grupUser) {
+                $namaDB = strtolower(trim($k->nama_bagian));
+                $grup = strtolower(trim($grupUser));
+                return (str_contains($namaDB, $grup) || str_contains($grup, $namaDB));
+            });
+
             if ($kategori->isEmpty()) {
-                $kategori = KategoriBagian::all();
+                $kategori = $semuaKategori;
             }
         }
 
         $listKategoriDokumen = $this->getListKategoriDokumen();
+        
         return view('arsip.create', compact('kategori', 'listKategoriDokumen'));
     }
 
     /**
-     * Simpan Data
+     * Simpan Data Arsip
      */
     public function store(Request $request)
     {
@@ -238,24 +268,40 @@ class ArsipController extends Controller
             return redirect()->route('dashboard')->with('error', 'Admin tidak memiliki akses.');
         }
 
-        $pemilikDokumen = $arsip->kategori_bagian->nama_bagian;
-        if (!in_array($role, ['pimpinan', 'ketua', 'wakil']) && $pemilikDokumen !== $grupUser) {
+        // Cek kepemilikan dokumen (Fuzzy Match)
+        $namaBagianDokumen = strtolower(trim($arsip->kategori_bagian->nama_bagian));
+        $namaGrupUser = strtolower(trim($grupUser));
+        
+        $punyaAkses = (str_contains($namaBagianDokumen, $namaGrupUser) || str_contains($namaGrupUser, $namaBagianDokumen));
+
+        if (!in_array($role, ['pimpinan', 'ketua', 'wakil']) && !$punyaAkses) {
             abort(403, 'Anda hanya bisa mengubah dokumen milik bagian Anda sendiri.');
         }
 
+        $semuaKategori = KategoriBagian::all();
+        
         if (in_array($role, ['pimpinan', 'ketua', 'wakil'])) {
-            $kategori = KategoriBagian::all();
+            $kategori = $semuaKategori;
         } else {
-            $kategori = KategoriBagian::where('nama_bagian', $grupUser)->get();
-            if ($kategori->isEmpty()) {
-                $kategori = KategoriBagian::all();
+            $kategori = $semuaKategori->filter(function ($k) use ($grupUser) {
+                $nDB = strtolower(trim($k->nama_bagian));
+                $gUser = strtolower(trim($grupUser));
+                return (str_contains($nDB, $gUser) || str_contains($gUser, $nDB));
+            });
+            
+            if ($kategori->isEmpty()) { 
+                $kategori = $semuaKategori; 
             }
         }
 
         $listKategoriDokumen = $this->getListKategoriDokumen();
+        
         return view('arsip.edit', compact('arsip', 'kategori', 'listKategoriDokumen'));
     }
 
+    /**
+     * Update Data Arsip
+     */
     public function update(Request $request, Arsip $arsip)
     {
         if (strtolower(auth()->user()->grup) == 'admin') {
@@ -292,36 +338,40 @@ class ArsipController extends Controller
         }
 
         $arsip->update($data);
+        
         return redirect()->route('arsip.index')->with('success', 'Arsip berhasil diperbarui!');
     }
 
+    /**
+     * Hapus Data Arsip
+     */
     public function destroy(Arsip $arsip)
     {
         if ($arsip->file_path && Storage::disk('public')->exists($arsip->file_path)) {
             Storage::disk('public')->delete($arsip->file_path);
         }
         $arsip->delete();
+        
         return redirect()->route('arsip.index')->with('success', 'Arsip berhasil dihapus!');
     }
 
     /**
-     * Tampilkan Detail Arsip & Komentar (PERBAIKAN ERROR MERAH)
+     * Tampilkan Detail Arsip & Komentar
      */
     public function show($id)
     {
-        // Cari data arsip
         $arsip = Arsip::with('kategori_bagian')->findOrFail($id);
-
-        // Ambil data komentar (Kita pakai \App\Models\Komentar biar pasti ketemu)
-        $komentars = \App\Models\Komentar::with('user')
+        $komentars = Komentar::with('user')
             ->where('arsip_id', $id)
             ->latest()
             ->get();
 
-        // Pastikan variabel 'komentars' masuk ke compact
         return view('arsip.show', compact('arsip', 'komentars'));
     }
 
+    /**
+     * Simpan Komentar
+     */
     public function storeKomentar(Request $request, $id)
     {
         $request->validate(['isi_komentar' => 'required|string']);
@@ -335,6 +385,9 @@ class ArsipController extends Controller
         return redirect()->back()->with('success', 'Komentar dikirim!');
     }
 
+    /**
+     * Cetak Daftar Arsip
+     */
     public function cetak(Request $request)
     {
         $user = auth()->user();
@@ -342,23 +395,41 @@ class ArsipController extends Controller
         $role = strtolower($grupUser);
 
         $query = Arsip::with('kategori_bagian');
-        $hakAksesLihat = HakAkses::where('grup_pengakses', $grupUser)->where('bisa_lihat', 1)->pluck('grup_pemilik')->toArray();
+        
+        // Logika Hak Akses Pintar untuk Cetak
+        $hakAksesLihat = HakAkses::whereRaw('LOWER(grup_pengakses) = ?', [strtolower($grupUser)])
+            ->where('bisa_lihat', 1)
+            ->pluck('grup_pemilik')
+            ->toArray();
+            
         $hakAksesLihat[] = $grupUser;
 
         if (!in_array($role, ['pimpinan', 'ketua', 'wakil'])) {
-            $query->whereHas('kategori_bagian', function ($q) use ($hakAksesLihat) {
-                $q->whereIn('nama_bagian', $hakAksesLihat);
-            });
+            $semuaKategori = KategoriBagian::all();
+            $kategoriDiizinkan = $semuaKategori->filter(function ($k) use ($hakAksesLihat) {
+                $nDB = strtolower(trim($k->nama_bagian));
+                foreach ($hakAksesLihat as $h) {
+                    $hA = strtolower(trim($h));
+                    if (str_contains($nDB, $hA) || str_contains($hA, $nDB)) return true;
+                }
+                return false;
+            })->pluck('id');
+
+            $query->whereIn('kategori_bagian_id', $kategoriDiizinkan);
         }
 
         if ($request->kategori_id) {
             $query->where('kategori_bagian_id', $request->kategori_id);
         }
+        
         $arsips = $query->latest()->get();
 
         return view('arsip.cetak', compact('arsips'));
     }
 
+    /**
+     * Cek Duplikasi Nomor Dokumen via AJAX
+     */
     public function cekNomor($nomor)
     {
         $exists = Arsip::where('nomor_dokumen', $nomor)->exists();
